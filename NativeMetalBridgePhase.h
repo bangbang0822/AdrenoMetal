@@ -14,6 +14,7 @@
 #include "GpuScanoutClient.h"
 #include <fcntl.h>
 #include <pthread.h>
+#include <pwd.h>        /* getpwuid: the shader-cache ladder's first candidate is the user's Library/Caches */
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -145,10 +146,37 @@ static void run(Gpu &gpu, const char *turnipPath) {
     gpu.mark(0x6500);
     Job *job = new Job{};
     job->turnip = turnipPath;
-    // A per-user cache directory of the host process (its sandbox allows it); the translated-shader cache goes in a subdirectory.
-    if (!confstr(_CS_DARWIN_USER_CACHE_DIR, job->cache, sizeof job->cache - 16)) strlcpy(job->cache, "/tmp/", sizeof job->cache);
-    strlcat(job->cache, "m2v", sizeof job->cache);
-    mkdir(job->cache, 0700);
+    // The translated-shader cache root must be writable by the process this runs in. The plugin's own device path already
+    // ladders these five candidates (NativeAdrenoMetalPlugin.mm:271-303) because the per-user cache directory is not always
+    // usable under a system process's sandbox; this path had one hard-coded choice and discarded mkdir's result, and
+    // metal2vulkan refuses to open the device when its shader-cache Directory::open cannot mkdir or probe-write it. That
+    // refusal is the whole of the "M s6501 ... ShaderCache" row: 0x6501 is this step (bridge/NativeMetalBridge.rs:306-310),
+    // not a GPU fault, and it is independent of the engine-write work. Same candidates and order as the plugin; the plugin
+    // additionally retries the device open once per directory, which this single-shot path cannot, so it takes the first
+    // directory that is writable.
+    {
+        char candidates[5][512] = {};
+        if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
+        if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
+        strlcpy(candidates[2], "/tmp/", sizeof candidates[2]);
+        strlcpy(candidates[3], "/private/var/tmp/", sizeof candidates[3]);
+        if (const passwd *user = getpwuid(getuid()); user && user->pw_dir && user->pw_dir[0]) {
+            snprintf(candidates[4], sizeof candidates[4] - 16, "%s/Library/Caches/com.apple.backboardd", user->pw_dir);
+            mkdir(candidates[4], 0700);
+            strlcat(candidates[4], "/", sizeof candidates[4]);
+        }
+        static const unsigned order[] = {4, 0, 1, 2, 3};
+        job->cache[0] = 0;
+        for (unsigned i : order) {
+            if (!candidates[i][0]) continue;
+            strlcat(candidates[i], "m2v", sizeof candidates[i]);
+            mkdir(candidates[i], 0700);
+            if (access(candidates[i], W_OK) != 0) continue;
+            strlcpy(job->cache, candidates[i], sizeof job->cache);
+            break;
+        }
+        if (!job->cache[0]) strlcpy(job->cache, "/tmp/m2v", sizeof job->cache);
+    }
     gGpu = &gpu;
     gJob = job;
     pthread_attr_t attr;
@@ -177,7 +205,15 @@ static void run(Gpu &gpu, const char *turnipPath) {
                             r.qc_functions, r.qc_kernels_ok, r.qc_kernels_failed, r.qc_pairs_ok, r.qc_pairs_failed);
     char *rest = text + (at > 0 && at < (int)sizeof text ? at : 0);
     const size_t room = sizeof text - (size_t)(rest - text);
-    if (job->code) snprintf(rest, room, " %s", r.message);
+    // A step that fails before any count exists has an empty counts field, and the 33 characters it leaves cut "device:
+    // ShaderCache(ShaderCacheError..." mid-word -- the one text that identifies the failure. Such a step spends the line on the
+    // message instead; a later step keeps its counts, because a 0x6504-0x6506 failure already carries compute/render/import
+    // (bridge/NativeMetalBridge.rs:318,323,328), which are the information there. A second streamText7 call cannot carry the rest:
+    // it starts a new GPU7 line and the page keeps only the latest, so it would replace this one (NativeAdrenoPublish.cpp:909-926).
+    const bool counted = r.compute_bad || r.render_bad || r.import_bad || r.qc_functions || r.qc_kernels_ok ||
+                         r.qc_kernels_failed || r.qc_pairs_ok || r.qc_pairs_failed;
+    if (job->code && !counted) snprintf(text, sizeof text, "M s%x %.54s", r.stage, r.message);
+    else if (job->code) snprintf(rest, room, " %s", r.message);
     else if (!job->frontendOpened) snprintf(rest, room, " Fo %s", job->error);
     else if (!job->frontendRan) snprintf(rest, room, " Fx %s", job->error);
     else if (job->frontend.failed) snprintf(rest, room, " F%u %s", job->frontend.failed, job->frontend.first);
